@@ -1,6 +1,0 @@
-# Correções
-
-Ao longo da construção da pipeline, foram identificados alguns problemas. Os dois principais foram:
-- O modelo de linguagem sugerido não era adequado para o problema pois ele foi treinado exclusivamente em inglês. No código, o modelo `all-MiniLM-L6-v2` for substituído pelo `paraphrase-multilingual-MiniLM-L12-v2`, que apresentou resultados muito melhores.
-- O método de chunking inicialmente considerado não estava dando bons resultados. A princípio, foi utilizado um chunking semântico baseado em `UnstructuredMarkdownLoader`, essa primeira abordagem foi substituída para usar `MarkdownHeaderTextSplitter` e `RecursiveCharacterTextSplitter`.
-- Além disso, a princípio ocorreram problemas pois os chunks estavam sendo recuperados baseados apenas na semântica da pergunta individualmente. Isso causava com que por exemplo, a tabela de multiplicador regional não fosse recuperado em uma consulta de frete para Manaus. Para resolver, foi implementada uma abordagem de small-to-big retrieval, recuperando chunks pequenos e expandindo o contexto baseado nesse chunk.
