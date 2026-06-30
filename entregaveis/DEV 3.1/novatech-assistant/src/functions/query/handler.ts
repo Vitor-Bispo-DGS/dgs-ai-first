@@ -4,7 +4,10 @@ import { ZodError } from "zod";
 import { validateQueryRequest } from "./validator.js";
 import { buildResponse } from "./response-builder.js";
 import { getEmbedding, getChatCompletion } from "../../services/completion.js";
-import { getAssistantResponseRejectionDetails } from "../../services/response-validator.js";
+import {
+  getAssistantResponseRejectionDetails,
+  GUARDRAIL_FALLBACK_ANSWER,
+} from "../../services/response-validator.js";
 import { searchChunks } from "../../services/search.js";
 import { buildPrompt, getSystemPrompt, initSystemPrompt } from "../../services/prompt-builder.js";
 import { createRequestLogger } from "../../shared/logger.js";
@@ -70,17 +73,28 @@ export async function queryHandler(
   } catch (error) {
     if (error instanceof ValidationError) {
       const rejectionDetails = getAssistantResponseRejectionDetails(error.cause);
+      const complianceViolations = rejectionDetails.filter((d) => d.isComplianceViolation);
 
       logger.warn(
         {
           stage: "assistant_response_invalid",
-          err: error,
           rejectionDetails,
+          reason: error.message,
+          isComplianceViolation: complianceViolations.length > 0,
           durationMs: Date.now() - start,
         },
-        "Assistant response rejected by validation"
+        complianceViolations.length > 0
+          ? "Compliance guardrail triggered — returning safe fallback"
+          : "Schema validation failed — returning safe fallback"
       );
-      return { status: 422, jsonBody: { error: error.message } };
+      return {
+        status: 200,
+        jsonBody: {
+          answer: GUARDRAIL_FALLBACK_ANSWER,
+          source_document: [],
+          confidence_score: 0,
+        },
+      };
     }
 
     logger.error(

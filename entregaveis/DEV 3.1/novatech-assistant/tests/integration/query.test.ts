@@ -140,33 +140,35 @@ describe("POST /api/query — integration", () => {
     expect(body.error).toBe("internal_error");
   });
 
-  it("returns 422 with the standard message when source_document is missing", async () => {
+  it("returns safe fallback when source_document is missing (Guardrail 1)", async () => {
     const { searchChunks } = await import("../../src/services/search.js");
     vi.mocked(searchChunks).mockResolvedValueOnce([]);
 
     const request = makeRequest({ question: "Qual é o prazo de devolução?" });
     const response = await queryHandler(request, makeContext());
 
-    expect(response.status).toBe(422);
-    const body = response.jsonBody as { error: string };
-    expect(body.error).toBe(
-      "Não consigo garantir uma resposta íntegra. Por favor, contate um superior ou tente novamente."
-    );
+    expect(response.status).toBe(200);
+    const body = response.jsonBody as { answer: string; source_document: string[]; confidence_score: number };
+    expect(body.answer).toBe("Não consigo encontrar uma resposta confiável, consulte um superior.");
+    expect(body.source_document).toEqual([]);
+    expect(body.confidence_score).toBe(0);
     expect(mockLogger.warn).toHaveBeenCalledWith(
       expect.objectContaining({
         stage: "assistant_response_invalid",
+        isComplianceViolation: false,
         rejectionDetails: expect.arrayContaining([
           expect.objectContaining({
             path: "source_document",
             reason: "source_document must contain at least one source",
+            isComplianceViolation: false,
           }),
         ]),
       }),
-      "Assistant response rejected by validation"
+      "Schema validation failed — returning safe fallback"
     );
   });
 
-  it("returns 422 when the assistant says dangerous cargo can be returned", async () => {
+  it("returns safe fallback when the assistant says dangerous cargo can be returned (Guardrail 2)", async () => {
     const { getChatCompletion } = await import("../../src/services/completion.js");
     vi.mocked(getChatCompletion).mockResolvedValueOnce(
       "A devolução de carga perigosa é possível com autorização prévia."
@@ -175,22 +177,24 @@ describe("POST /api/query — integration", () => {
     const request = makeRequest({ question: "Posso devolver carga perigosa?" });
     const response = await queryHandler(request, makeContext());
 
-    expect(response.status).toBe(422);
-    const body = response.jsonBody as { error: string };
-    expect(body.error).toBe(
-      "Não consigo garantir uma resposta íntegra. Por favor, contate um superior ou tente novamente."
-    );
+    expect(response.status).toBe(200);
+    const body = response.jsonBody as { answer: string; source_document: string[]; confidence_score: number };
+    expect(body.answer).toBe("Não consigo encontrar uma resposta confiável, consulte um superior.");
+    expect(body.source_document).toEqual([]);
+    expect(body.confidence_score).toBe(0);
     expect(mockLogger.warn).toHaveBeenCalledWith(
       expect.objectContaining({
         stage: "assistant_response_invalid",
+        isComplianceViolation: true,
         rejectionDetails: expect.arrayContaining([
           expect.objectContaining({
             path: "answer",
             reason: "dangerous cargo return answers cannot state that return is possible",
+            isComplianceViolation: true,
           }),
         ]),
       }),
-      "Assistant response rejected by validation"
+      "Compliance guardrail triggered — returning safe fallback"
     );
   });
 });
