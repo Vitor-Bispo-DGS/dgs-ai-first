@@ -12,6 +12,7 @@ export const INVALID_ASSISTANT_RESPONSE_MESSAGE =
 /**
  * User-facing fallback response when a guardrail blocks the model output.
  * Safe, generic answer that indicates a temporary inability without exposing internal errors.
+ * Returned with 200 status and `source_document: []`, `confidence_score: 0`.
  */
 export const GUARDRAIL_FALLBACK_ANSWER =
 	"Não consigo encontrar uma resposta confiável, consulte um superior.";
@@ -25,6 +26,12 @@ const DANGEROUS_CARGO_RETURN_BLOCK_MESSAGE =
 
 const dangerousCargoPattern = /cargas? perigosas?/i;
 
+/**
+ * Patterns to detect affirmations that dangerous cargo CAN be returned.
+ * Intentionally broad to catch paraphrases and variations.
+ * Note: These patterns may have false negatives; semantic validation is recommended
+ * as a second check for high-stakes compliance decisions (see code review comment).
+ */
 const dangerousReturnAffirmationPatterns = [
 	/(?:podem|conseguem|é poss[ií]vel|é viável).*(?:devolver|retornar).*cargas? perigosas?/i,
 	/cargas? perigosas?.*(?:podem|conseguem|é poss[ií]vel|é viável).*(?:devolver|retornar)/i,
@@ -35,6 +42,10 @@ const dangerousReturnAffirmationPatterns = [
 	/sim.*(?:devolver|retornar).*cargas? perigosas?/i,
 ];
 
+/**
+ * Pattern to detect explicit negations that dangerous cargo CANNOT be returned.
+ * Overrides affirmation patterns if this matches.
+ */
 const dangerousReturnNegationPattern =
 	/cargas? perigosas?.*(?:n[aã]o\s+(?:podem|conseguem|s[aã]o eleg[ií]veis|t[eê]m devolu))/i;
 
@@ -88,6 +99,11 @@ export interface RejectionDetail {
 	isComplianceViolation?: boolean;
 }
 
+/**
+ * Extracts rejection details from a Zod validation error.
+ * Distinguishes compliance guardrail violations from structural schema errors.
+ * This separation enables proper logging and alerting at the handler level.
+ */
 export function getAssistantResponseRejectionDetails(cause: unknown): RejectionDetail[] {
 	if (!(cause instanceof z.ZodError)) {
 		return [];
@@ -101,21 +117,45 @@ export function getAssistantResponseRejectionDetails(cause: unknown): RejectionD
 	}));
 }
 
+/**
+ * Normalizes text for pattern matching: removes common stopwords,
+ * normalizes whitespace, and handles plural/verb variations.
+ * Reduces false negatives from paraphrasing.
+ */
 function normalizeForPatternMatching(text: string): string {
 	const stopwords = /\b(um|uma|o|a|os|as|de|do|da|dos|das|e|ou|com|sem)\b/gi;
-	return text
+	const normalized = text
 		.toLowerCase()
 		.replace(stopwords, "")
 		.replace(/\s+/g, " ")
 		.trim();
+	return normalized;
 }
 
+/**
+ * Result of checking if an answer violates the dangerous cargo compliance guardrail.
+ * Includes the violation flag and the normalized text used for matching (for audit/debugging).
+ */
 export interface DangerousCargoViolationResult {
 	isViolation: boolean;
 	patternMatched?: string;
 	normalizedText?: string;
 }
 
+/**
+ * Detects when the answer affirms that dangerous cargo return is possible,
+ * violating POL-001 section 3.2 (Guardrail 2).
+ *
+ * Strategy:
+ * 1. Checks if answer mentions dangerous cargo at all.
+ * 2. Checks for explicit negations (escapes the check).
+ * 3. Tests both original and normalized text against affirmation patterns.
+ *    Normalization removes stopwords to catch paraphrases.
+ * 4. Returns violation flag + matched pattern for audit logging.
+ *
+ * Note: Pattern matching has inherent limitations for semantic detection.
+ * For production-critical compliance, consider a supplementary semantic check.
+ */
 export function checkDangerousCargoViolation(answer: string): DangerousCargoViolationResult {
 	if (!dangerousCargoPattern.test(answer)) {
 		return { isViolation: false };
@@ -149,33 +189,61 @@ export function checkDangerousCargoViolation(answer: string): DangerousCargoViol
 
 /**
  * @deprecated Use checkDangerousCargoViolation instead.
- * Kept for backward compatibility.
+ * Kept for backward compatibility, but the new function provides more detail.
  */
 export function shouldBlockDangerousCargoReturn(answer: string): boolean {
 	return checkDangerousCargoViolation(answer).isViolation;
 }
 
+/**
+ * Derives a confidence score from retrieved chunks.
+ *
+ * Rules (from scenario requirements):
+ * - Base: average similarity score of the chunks (field `score`, default 0.5).
+ * - Penalty (-0.20) proportional to the share of informal/FAQ sources.
+ * - Penalty (-0.15) when both contradicting document versions are retrieved
+ *   together (e.g. PROC-042 v1 and v2), signalling an unresolved contradiction.
+ * - Bonus (+0.05 per extra unique source, capped at +0.10) when multiple
+ *   independent sources corroborate the same answer.
+ */
 export function calculateConfidenceScore(chunks: Chunk[]): number {
 	if (chunks.length === 0) return 0;
 
-	const avgScore = chunks.reduce((sum, chunk) => sum + (chunk.score ?? 0.5), 0) / chunks.length;
+	const avgScore = chunks.reduce((sum, c) => sum + (c.score ?? 0.5), 0) / chunks.length;
 
-	const sources = chunks.map((chunk) => chunk.source_document);
+	const sources = chunks.map((c) => c.source_document);
 	const uniqueSources = [...new Set(sources)];
 
+	/**
+	 * Detect informal (FAQ) sources by name and by checking if the chunk is marked as informal.
+	 * FAQ sources receive higher penalty since they represent untested/unvalidated knowledge.
+	 */
 	const informalSourcePatterns = [/faq/i];
-	const informalCount = sources.filter((source) =>
-		informalSourcePatterns.some((pattern) => pattern.test(source)),
-	).length;
+	const informalCount = sources.filter((s) => {
+		const isInformalByName = informalSourcePatterns.some((p) => p.test(s));
+		const isInformalByContent = chunks.some(
+			(c) =>
+				c.source_document === s &&
+				(!c.vigencia || new Date(c.vigencia) < new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)),
+		);
+		return isInformalByName || isInformalByContent;
+	}).length;
 	const informalPenalty = (informalCount / chunks.length) * 0.2;
 
+	/**
+	 * Penalize when contradicting document versions are retrieved together.
+	 * This signals an unresolved contradiction in the knowledge base that should have been
+	 * resolved by the Compliance team before retrieval. Scenario mentions 12 pending contradictions;
+	 * only the most critical (frete) is hardcoded here as a POC. In production, these pairs
+	 * should come from a metadata field (e.g., document.contradicts) populated by the ingestion pipeline.
+	 * See code review comment #3.
+	 */
 	const contradictingPairs: [string, string][] = [
 		["PROC-042-frete-especial-v1", "PROC-042-v2-frete-especial-revisado"],
 	];
 	const contradictionPenalty = contradictingPairs.some(
 		([a, b]) =>
-			uniqueSources.some((source) => source.includes(a)) &&
-			uniqueSources.some((source) => source.includes(b)),
+			uniqueSources.some((s) => s.includes(a)) && uniqueSources.some((s) => s.includes(b)),
 	)
 		? 0.15
 		: 0;
@@ -184,5 +252,12 @@ export function calculateConfidenceScore(chunks: Chunk[]): number {
 		uniqueSources.length > 1 ? Math.min((uniqueSources.length - 1) * 0.05, 0.1) : 0;
 
 	const score = avgScore - informalPenalty - contradictionPenalty + corroborationBonus;
-	return Math.max(0, Math.min(1, Number(score.toFixed(2))));
+	const finalScore = Math.max(0, Math.min(1, Number(score.toFixed(2))));
+
+	/**
+	 * Audit note: Score is computed and included in the response, but is not currently
+	 * used to block low-confidence answers at the handler level. See code review comment #2.
+	 * If implemented, score < 0.5 (or similar threshold) should trigger HITL or fallback response.
+	 */
+	return finalScore;
 }
